@@ -249,11 +249,12 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 | 开关（config.json）  | 默认    | 作用                                                                                                                                                                                                                                                                                                                                     |
 | -------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `toolResultImages`   | `true`  | `tool_result` 内嵌的图片块抽出，注入**同轮末尾的 user 消息**：先插一条文本 part `[tool_result <id> 附带的图片]`，再接 `image_url` part。`false` 时丢弃（折叠为 `[image]` 占位符）                                                                                                                                                        |
+| `toolResultImages`   | `true`  | 工具结果里的图片块抽出，注入**同轮末尾的 user 消息**：先插一条文本 part `[tool_result <id> 附带的图片]`，再接 `image_url` part。**两条链路都生效**——`/v1/messages` 的 `tool_result.content` 与 `/v1/responses`（Codex）的 `function_call_output.output` / `custom_tool_call_output.output` 里的 `input_image`。`false` 时丢弃（图片在 tool 文本里折叠为 `[image]` 占位符）                                                                                        |
 | `visionAutoRoute`    | `true`  | 带图请求**前置路由**：决策出的模型判定不支持视觉（判定为 `modelCatalog` 的 `vision` 字段与 `defaultVisionModels` 白名单的**并集**：在名单内 / catalog `vision:true` 视为支持），则**不发该模型**、改走 `defaultVisionModels[0]`，免上游 400 / 静默盲视（200 假装看不见）。`false` = 保持现状（先按原模型发，失败靠 `switchOnFail` 轮换） |
 | `cleanHistoryImages` | `false` | 仅 `/v1/messages` 转换链路：本轮（最后一条 user 消息）**无新图**时，把该消息之前所有图片块（含 `tool_result` 内嵌）**原位替换**为占位文本 `[历史图片已清理]`。历史里的图上游同样 400，剥离后请求可安全回流纯文本模型，带图路由随之只看新图——会话不再被历史图片钉死在视觉模型                                                             |
 
 - 判定"是否支持视觉"时 `modelCatalog` 与 `defaultVisionModels` 是**并集**关系：`defaultVisionModels` 是用户显式声明"带图用它"（白名单，优先信任），`modelCatalog` 提供 catalog 里非白名单模型的权威 `vision` 字段；两者都不覆盖时视为不支持。
+- **图片绝不能留在 tool 消息文本里**（两条链路同）：上游会把 tool 文本当纯文本分词，base64 全文进上下文——模型**看不见图**（盲视），且每张图白烧几万 token。实测 Codex 工具出图：一张 57KB 截图 ≈ **53K token**（真按视觉编码只要几百），三四张就把上下文顶爆成 `400 invalid request error trace_id: ...`。抽出注入 user 消息后同一请求降到几百 token，图片也真正可见。
 - 替换是**确定性**的：同一段历史每轮剥出逐字节一致的结果，不破坏前缀缓存（代价是历史图片内容对模型不可见）。
 - 纯文本路径（无图请求）逐字节保持旧行为，`toolResultImages=false` 时文本也完全不变。
 - 日志侧：REQ 行显示 `img=N(新M)`——`N` 为请求体中的图片块总数，`新M` 为最后一条 user 消息（本轮）中的新图数；本轮有新图时会话标签加 `@` 前缀（`@S3#3`）。
@@ -353,7 +354,7 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 | `blockedModels`            | `[]`                                  | 从 `/v1/models` 列表隐藏（避免客户端误选）；**转发时不拦截**，命中只打印一次性告警                                                                     |
 | `cleanHistoryImages`       | `false`                               | 本轮无新图时把历史图片块替换为 `[历史图片已清理]`（见「多模态」）                                                                                      |
 | `reasoningBridge`          | `true`                                | reasoning/thinking 桥接总开关：`true`/`false`，或对象细调 `{maxChars, passthrough, placeholder}`（见「reasoning / thinking 桥接」）                    |
-| `toolResultImages`         | `true`                                | `tool_result` 内嵌图片保留并注入后续 user 消息；`false` 折叠为 `[image]`                                                                               |
+| `toolResultImages`         | `true`                                | 工具结果内嵌图片（`/v1/messages` 的 `tool_result`、`/v1/responses` 的 `function_call_output`）抽出注入后续 user 消息；`false` 折叠为 `[image]` 占位符 |
 | `visionAutoRoute`          | `true`                                | 带图请求前置路由：模型判定不支持视觉则改走 `defaultVisionModels[0]`（见「多模态」）                                                                    |
 | `jsonlLog`                 | 关闭                                  | 结构化 JSONL 请求日志：`true` 写 `requests.jsonl`，字符串为自定义路径；`false`/缺省关闭（见「结构化请求日志 (JSONL)」）                                |
 | `jsonlRotateDays`          | `30`                                  | JSONL 按日切分保留天数：当日写 `requests.jsonl`，跨日归档 `requests-YYYY-MM-DD.jsonl`，过期清理；`0`/`false` 关闭切分（可用 `--jsonlRotateDays` 覆盖） |
@@ -602,6 +603,8 @@ Get-NetTCPConnection -LocalPort 5411 -State Listen | Stop-Process
 **请求报 `MODEL_NOT_IN_PLAN`** — 该模型 GOAT 订阅不可用（`403`）。此错误属确定性失败，**不会原地重试**，开启 `switchOnFail` 时当场换下一个模型，并让该模型冷却 `failTTL`；也可以手动调整 `defaultModels` / `defaultVisionModels` 或把该模型从 `blockedModels` 里排除。
 
 **带图请求拿到空/瞎编回答或 400** — 上游纯文本模型（如 `deepseek-v4-flash`）对图片的行为是 **400 拒绝 或 200 静默盲视**（实测两种都有，不同供应商/网关形态不一）。默认开启 `visionAutoRoute`：带图请求决策出的模型若判定不支持视觉，会**前置改走** `defaultVisionModels[0]`，不再把图片发给它。`visionAutoRoute: false` 时退回"先发原模型 + `switchOnFail.image` 轮换"的旧行为。历史图片会把会话一直钉在视觉模型上——先剥后送可用 `cleanHistoryImages: true`。
+
+**Codex 用工具看图后报 `400 invalid request error trace_id: ...`** — 症状：会话里用 `browser.preview` / 读图工具返回过图片后，下一轮必 400；工具图越多越早触发（三四张就 400），且**之前每轮其实一直是盲视**（模型看不见那些图，只在胡诌）。原因是图片被留在 `tool` 消息文本里，上游按纯文本分词，base64 全量进上下文，一张 57KB 图 ≈ 53K token。当前版本两条链路都会把工具结果里的图片抽出、注入同轮末尾的 user 消息（见「多模态」的 `toolResultImages`）。排查看 REQ 行的 `img=N` 与 RES 行的 `in:`——同一批图 `in:` 应该是几百（视觉编码）而不是几万（base64 文本）；若 `in:` 随图片大小暴涨，说明图片又漏进 tool 文本了。
 
 **想用真正的 Claude 模型** — 需要升级 Pro/Provider 计划；升级后在 `modelMap` 中把 `claude-*` 映射为真实 Claude 模型名（如 `claude-sonnet-4-6`）即可直连上游 `/messages`（`isClaudeModel()` 判定）。
 

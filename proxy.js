@@ -160,6 +160,27 @@ const HOST = argVal("--host", config.host || "127.0.0.1");
 const UPSTREAM = (config.upstream || "https://api.commandcode.ai/provider").replace(/\/+$/, "");
 const API_KEY = process.env.CMDC_API_KEY || config.apiKey || "";
 
+// 上游出口代理: Node fetch 不读 macOS 系统代理, 直连 Cloudflare 大包上传会间歇
+// ETIMEDOUT (~622ms, 约 50%); 经本机 Clash HTTP 代理 (与系统代理同地址) 则稳定。
+// upstreamDispatcher 只用于上游请求。关闭: CMC_UPSTREAM_PROXY="" 或 config.upstreamProxy=""。
+let upstreamDispatcher;
+try {
+  const { ProxyAgent } = require("undici");
+  const proxyUrl = ("CMC_UPSTREAM_PROXY" in process.env)
+    ? process.env.CMC_UPSTREAM_PROXY
+    : (config.upstreamProxy || "http://127.0.0.1:7897");
+  if (proxyUrl) {
+    // keepAliveMaxTimeout 收敛到 30s: 上游/中转空闲掐连接后, 复用池里的旧连接会触发
+    // "other side closed" 竞态; 缩短复用上限把这类失败压到最低, 剩下的靠同模型退避重试兜底
+    upstreamDispatcher = new ProxyAgent({ uri: proxyUrl, keepAliveMaxTimeout: 30000 });
+    console.log(`[cmc-proxy] 上游出口代理: ${proxyUrl}`);
+  } else {
+    console.log("[cmc-proxy] 上游出口代理已关闭, 上游直连");
+  }
+} catch (e) {
+  console.warn(`[cmc-proxy] undici 未安装 (npm i undici), 上游直连: ${e.message}`);
+}
+
 // 缓存优化开关 (可选配置, 默认开启; 关闭后回退为最朴素的转换行为)
 const CC_PASSTHROUGH = config.cacheControlPassthrough !== false; // Anthropic cache_control -> OpenAI content part
 const CACHE_AFFINITY = config.cacheAffinity !== false; // 按会话注入 user / prompt_cache_key
@@ -453,6 +474,9 @@ const switchOnFailFor = (isImage) => {
   }
   return false;
 };
+// ---- rotateModels: 是否允许换模型轮换, 支持布尔或 {text, image} (默认 true) ----
+// false 时候选序列只保留首个模型: 同模型原地重试 (firstModelAttempts + 退避) 照常,
+// 但永不切换到其他模型, 打完直接透传最后一次结果。适合"我就要这个模型" 的场景。
 // ---- firstModelAttempts: 首个选定模型在轮换前的尝试次数 (含首发) ----
 // switchOnFail=true 时, 首个候选 (客户端显式指定 / 兜底默认, 即候选序列 i===0) 先原地重试:
 // 同模型再发一次只对**瞬时故障**有意义 (RETRY_STATUSES 的状态码与网络层错误), 确定性失败
@@ -1627,11 +1651,89 @@ function responsesUserBlocksToParts(blocks) {
   return parts;
 }
 
+/** Responses 的 input_image 块 (image_url 字符串 / {source:{url}}) -> OpenAI image_url part */
+function responsesImagePart(url) {
+  if (!url || typeof url !== "string") return null;
+  return { type: "image_url", image_url: { url } };
+}
+
+/** function_call_output.output 里的图片块 -> image_url part 数组 (空数组 = 无图)。
+ *  上游 tool 消息不支持带图 (实测 400), 图片统一抽出注入随后的 user 消息 */
+function toolOutputImageParts(output) {
+  const list = Array.isArray(output) ? output : output && typeof output === "object" ? [output] : [];
+  const parts = [];
+  for (const x of list) {
+    if (!x || typeof x !== "object") continue;
+    if (x.type === "input_image") {
+      const p = responsesImagePart(x.image_url || (x.source && x.source.url));
+      if (p) parts.push(p);
+    }
+  }
+  return parts;
+}
+
+/** function_call_output.output -> tool 消息文本: 文本块取 text, 图片块折叠为 [image] 占位。
+ *  与 Anthropic 链路的 toolResultToText 语义一致 —— 图片绝不能留在 tool 文本里:
+ *  留在这里会被上游当纯文本分词 (base64 全文进上下文), 既看不见图又白烧几十K token */
+function toolOutputToText(output) {
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) {
+    return output
+      .map((x) => {
+        if (x && typeof x === "object") {
+          if (x.type === "input_text" || x.type === "text") return typeof x.text === "string" ? x.text : "";
+          if (x.type === "input_image" || x.type === "image") return "[image]";
+        }
+        return `[${(x && x.type) || "unknown"}]`;
+      })
+      .join("");
+  }
+  return output == null ? "" : JSON.stringify(output);
+}
+
+/** 抽出的 tool 图片 -> 追加到 user 消息尾部的 parts (带来源标签, 结构确定不破坏前缀缓存) */
+function appendToolImageParts(parts, pendingToolImgs) {
+  for (const { id, imgs } of pendingToolImgs) {
+    parts.push({ type: "text", text: id ? `[tool_result ${id} 附带的图片]` : "[tool_result 附带的图片]" });
+    for (const p of imgs) parts.push(p);
+  }
+}
+
 function responsesInputToChatMessages(input) {
   const messages = [];
   // codex 0.150 alpha 会把附加工具定义 (deferred 工具加载结果等) 以 additional_tools
   // 条目内联在对话历史中, 收集后合并进请求 tools (见 responsesToChatRequest)
   const additionalTools = [];
+  // 历史条目自带的工具 namespace (如 function_call.namespace="multi_agent_v1"):
+  // 回传重建时补回, codex 本地路由靠它分发, 丢了会报 "unsupported call"
+  const toolNamespaces = new Map();
+  const learnNs = (item) => {
+    if (item && typeof item.name === "string" && typeof item.namespace === "string" && item.namespace) {
+      if (!toolNamespaces.has(item.name)) toolNamespaces.set(item.name, item.namespace);
+    }
+  };
+  // tool 结果里的图片 (TOOL_RESULT_IMAGES): 上游 tool 消息不能带图, 图片抽出后
+  // 暂存这里, 注入紧随其后的 user 消息 (见 appendToolImageParts)。
+  // 不做的话 base64 会留在 tool 文本里被上游当纯文本分词 —— 看不见图, 且每张图
+  // 烧掉几万 token (57KB 图 ≈ 53K token), 三四张就把上下文顶爆成 400
+  let pendingToolImgs = [];
+  const stashToolImgs = (id, output) => {
+    // 图片永远不进 tool 文本 (折叠为 [image] 占位, 同 Anthropic 链路的 toolResultToText);
+    // toolResultImages=false 时额外不把它们注入 user 消息 —— 图片即丢弃
+    if (TOOL_RESULT_IMAGES) {
+      const imgs = toolOutputImageParts(output);
+      if (imgs.length) pendingToolImgs.push({ id, imgs });
+    }
+    return toolOutputToText(output);
+  };
+  // 循环收尾: 末尾没有 user 消息可注入时, 合成一条只带图的 user 消息 (否则图片丢失)
+  const flushPendingToolImgs = () => {
+    if (!pendingToolImgs.length) return;
+    const parts = [];
+    appendToolImageParts(parts, pendingToolImgs);
+    pendingToolImgs = [];
+    if (parts.length) messages.push({ role: "user", content: parts });
+  };
   // reasoning 条目 (Codex 回传的思考): 取文本附着到紧随的 assistant 消息上, 满足 DeepSeek 系
   // thinking 模式对历史 assistant(tool_calls) 的 reasoning_content 要求
   let pendingReasoning = "";
@@ -1643,9 +1745,9 @@ function responsesInputToChatMessages(input) {
   // input 可以是字符串
   if (typeof input === "string") {
     if (input) messages.push({ role: "user", content: input });
-    return { messages, additionalTools };
+    return { messages, additionalTools, toolNamespaces };
   }
-  if (!Array.isArray(input)) return { messages, additionalTools };
+  if (!Array.isArray(input)) return { messages, additionalTools, toolNamespaces };
 
   for (const item of input) {
     if (!item || typeof item !== "object") {
@@ -1667,13 +1769,13 @@ function responsesInputToChatMessages(input) {
         // 兼容旧版形态: function_call_output 嵌在 user 消息 content 里
         const nestedOutputs = blocks.filter((b) => b.type === "function_call_output");
         for (const b of nestedOutputs) {
-          messages.push({
-            role: "tool",
-            tool_call_id: b.call_id || b.id || "",
-            content: stringifyMaybeJSON(b.output),
-          });
+          const id = b.call_id || b.id || "";
+          messages.push({ role: "tool", tool_call_id: id, content: stashToolImgs(id, b.output) });
         }
         const parts = responsesUserBlocksToParts(blocks.filter((b) => b.type !== "function_call_output"));
+        // 本条 user 消息顺带承载前面 tool 结果抽出的图片 (结构确定, 不破坏前缀缓存)
+        appendToolImageParts(parts, pendingToolImgs);
+        pendingToolImgs = [];
         if (parts.length) {
           // 单文本折叠成字符串 (结构确定, 不随轮次变化)
           messages.push({
@@ -1704,6 +1806,7 @@ function responsesInputToChatMessages(input) {
 
     if (type === "function_call") {
       // 顶层工具调用: 合并进紧邻的前一条 assistant 消息
+      learnNs(item);
       pushToolCallToMessages(messages, {
         id: item.call_id || item.id || `call_local_${messages.length}`,
         type: "function",
@@ -1717,17 +1820,15 @@ function responsesInputToChatMessages(input) {
     }
 
     if (type === "function_call_output") {
-      messages.push({
-        role: "tool",
-        tool_call_id: item.call_id || item.id || "",
-        content: stringifyMaybeJSON(item.output),
-      });
+      const id = item.call_id || item.id || "";
+      messages.push({ role: "tool", tool_call_id: id, content: stashToolImgs(id, item.output) });
       continue;
     }
 
     if (type === "custom_tool_call") {
       // freeform 工具调用历史: input 为原文 (如补丁文本), 统一包成 {"input": ...} 与
       // 我们发给模型时的参数形态保持一致 (前缀稳定)
+      learnNs(item);
       pushToolCallToMessages(messages, {
         id: item.call_id || item.id || `call_local_${messages.length}`,
         type: "function",
@@ -1741,11 +1842,8 @@ function responsesInputToChatMessages(input) {
     }
 
     if (type === "custom_tool_call_output") {
-      messages.push({
-        role: "tool",
-        tool_call_id: item.call_id || item.id || "",
-        content: stringifyMaybeJSON(item.output),
-      });
+      const id = item.call_id || item.id || "";
+      messages.push({ role: "tool", tool_call_id: id, content: stashToolImgs(id, item.output) });
       continue;
     }
 
@@ -1789,7 +1887,8 @@ function responsesInputToChatMessages(input) {
 
     if (type) warnSkippedItemType(type); // local_shell_call / computer_call 等保留类型
   }
-  return { messages, additionalTools };
+  flushPendingToolImgs(); // 末尾没有 user 消息可注入时, 补一条只带图的 user 消息
+  return { messages, additionalTools, toolNamespaces };
 }
 
 /** 把 Responses 请求体转换为 chat/completions 请求体 */
@@ -1797,7 +1896,7 @@ function responsesToChatRequest(body, sessionKey, ctx = {}) {
   const mapped = body.model; // model 由调用方 (pickModel) 决策后覆盖
   const messages = [];
   if (body.instructions) messages.push({ role: "system", content: body.instructions });
-  const { messages: inputMessages, additionalTools } = responsesInputToChatMessages(body.input);
+  const { messages: inputMessages, additionalTools, toolNamespaces: inputNamespaces } = responsesInputToChatMessages(body.input);
   messages.push(...inputMessages);
   backfillReasoning(messages, ctx.session); // 同 Anthropic 链路 (见 REASONING_BRIDGE)
   const req = { model: mapped, messages, stream: !!body.stream };
@@ -1810,15 +1909,22 @@ function responsesToChatRequest(body, sessionKey, ctx = {}) {
   }
   // 本请求中被转为 function 的 freeform(custom) 工具名集合, 回传时还原 custom_tool_call
   const customToolNames = new Set();
+  // 工具名 -> namespace (如 spawn_agent -> multi_agent_v1): codex 本地路由靠它分发,
+  // 丢失会导致 "unsupported call"。来源: namespace 声明分组 + 自带 namespace 的历史条目。
+  const toolNamespaces = new Map();
+  // 顶层 (非分组) 声明过的工具名: 如 builtin apply_patch 与 mcp__patchloom 内同名工具
+  // 冲突时, 顶层优先 (上游按名去重也是顶层优先, 回来的调用必属顶层), 后续统一清掉误映射
+  const topLevelNames = new Set();
   const addedToolNames = new Set();
   const chatTools = [];
-  const convertTool = (t) => {
+  const convertTool = (t, inNs = null) => {
       if (!t || typeof t !== "object") return;
       if (t.type === "custom" && t.name) {
         // freeform/custom 工具 (如 apply_patch grammar): chat/completions 无对应概念,
         // 统一转成 {"input": "<原文>"} 单参数 function, 回传时还原 custom_tool_call
         // (codex 的 apply_patch handler 只接受 Custom payload, 收到 function_call 直接报错)
         customToolNames.add(t.name);
+        if (inNs == null) topLevelNames.add(t.name);
         if (addedToolNames.has(t.name)) return; // 按名去重: 顶层定义优先
         addedToolNames.add(t.name);
         chatTools.push({
@@ -1860,8 +1966,12 @@ function responsesToChatRequest(body, sessionKey, ctx = {}) {
         return;
       }
       if (t.type === "namespace" && Array.isArray(t.tools)) {
-        // 工具组 (如按 MCP server 分组): 展开为独立工具
-        for (const nt of t.tools) convertTool(nt);
+        // 工具组 (如按 MCP server 分组): 展开为独立工具, 同时记住名->namespace 映射
+        // (顶层同名工具优先, 见后文清理: 如 builtin apply_patch vs mcp__patchloom 内同名项)
+        for (const nt of t.tools) {
+          if (nt && typeof nt.name === "string" && typeof t.name === "string" && !topLevelNames.has(nt.name)) toolNamespaces.set(nt.name, t.name);
+          convertTool(nt, typeof t.name === "string" ? t.name : null);
+        }
         return;
       }
       const fn = t.function && typeof t.function === "object" ? t.function : t;
@@ -1869,6 +1979,7 @@ function responsesToChatRequest(body, sessionKey, ctx = {}) {
         warnSkippedToolType(t.type || "unknown");
         return;
       }
+      if (inNs == null) topLevelNames.add(fn.name);
       if (addedToolNames.has(fn.name)) return;
       addedToolNames.add(fn.name);
       chatTools.push({
@@ -1898,7 +2009,12 @@ function responsesToChatRequest(body, sessionKey, ctx = {}) {
     req.prompt_cache_key = body.prompt_cache_key;
     if (body.prompt_cache_key.length <= 64) req.user = body.prompt_cache_key;
   }
-  return { chat: req, customToolNames };
+  // 历史学到的名->namespace 映射并入 (声明分组优先, 已有不覆盖)
+  if (inputNamespaces) for (const [k, v] of inputNamespaces) if (!toolNamespaces.has(k)) toolNamespaces.set(k, v);
+  // 顶层与分组同名时顶层优先 (上游按名去重也是顶层优先): 删掉误映射,
+  // 如 builtin apply_patch 绝不能带 mcp__patchloom 的 namespace
+  for (const n of topLevelNames) toolNamespaces.delete(n);
+  return { chat: req, customToolNames, toolNamespaces };
 }
 
 // ---------------------------------------------------------------------------
@@ -1940,8 +2056,9 @@ function customInputFromArguments(args) {
   return args;
 }
 
-function chatMessageToResponsesOutput(msg, customToolNames) {
+function chatMessageToResponsesOutput(msg, customToolNames, toolNamespaces) {
   const output = [];
+  const nsOf = (name) => (toolNamespaces && name && toolNamespaces.get(name)) || undefined;
   if (msg.content) {
     output.push({
       type: "message",
@@ -1955,33 +2072,39 @@ function chatMessageToResponsesOutput(msg, customToolNames) {
     if (customToolNames && customToolNames.has(tc.function.name)) {
       // freeform 工具: 还原为 custom_tool_call (codex 的 apply_patch handler 只接受
       // ToolPayload::Custom, 收到 function_call 直接报 "unsupported payload")
-      output.push({
+      const ctc = {
         type: "custom_tool_call",
         id: makeResponsesId("ctc"),
         status: "completed",
         call_id: tc.id,
         name: tc.function.name,
         input: customInputFromArguments(tc.function.arguments),
-      });
+      };
+      const ns = nsOf(tc.function.name);
+      if (ns) ctc.namespace = ns;
+      output.push(ctc);
     } else {
-      output.push({
+      const fc = {
         type: "function_call",
         id: makeResponsesId("fc"),
         status: "completed",
         call_id: tc.id,
         name: tc.function.name,
         arguments: tc.function.arguments || "{}",
-      });
+      };
+      const ns = nsOf(tc.function.name);
+      if (ns) fc.namespace = ns;
+      output.push(fc);
     }
   }
   return output;
 }
 
 /** 非流式: chat.completion -> response 对象 */
-function chatResponseToResponses(obj, requestedModel, customToolNames) {
+function chatResponseToResponses(obj, requestedModel, customToolNames, toolNamespaces) {
   const choice = obj.choices && obj.choices[0] ? obj.choices[0] : {};
   const msg = choice.message || {};
-  const output = chatMessageToResponsesOutput(msg, customToolNames);
+  const output = chatMessageToResponsesOutput(msg, customToolNames, toolNamespaces);
   return {
     id: makeResponsesId("resp"),
     object: "response",
@@ -1996,9 +2119,10 @@ function chatResponseToResponses(obj, requestedModel, customToolNames) {
 
 /** 流式: chat SSE chunks -> Responses SSE 事件序列 */
 class ResponsesStreamConverter {
-  constructor(requestedModel, estimateInputTokens = 0, customToolNames = null) {
+  constructor(requestedModel, estimateInputTokens = 0, customToolNames = null, toolNamespaces = null) {
     this.requestedModel = requestedModel;
     this.customToolNames = customToolNames; // 本请求中转为 function 的 freeform 工具名
+    this.toolNamespaces = toolNamespaces; // 工具名 -> namespace (本地路由分发用)
     this.resp = {
       id: makeResponsesId("resp"),
       object: "response",
@@ -2119,9 +2243,10 @@ class ResponsesStreamConverter {
       }
       if (!st.item) {
         st.isCustom = !!(this.customToolNames && st.name && this.customToolNames.has(st.name));
+        const stNs = (this.toolNamespaces && st.name && this.toolNamespaces.get(st.name)) || undefined;
         st.item = st.isCustom
-          ? { id: makeResponsesId("ctc"), type: "custom_tool_call", status: "in_progress", call_id: st.callId || `call_${Date.now()}`, name: st.name || "function", input: "" }
-          : { id: makeResponsesId("fc"), type: "function_call", status: "in_progress", call_id: st.callId || `call_${Date.now()}`, name: st.name || "function", arguments: "" };
+          ? { id: makeResponsesId("ctc"), type: "custom_tool_call", status: "in_progress", call_id: st.callId || `call_${Date.now()}`, name: st.name || "function", input: "", ...(stNs ? { namespace: stNs } : null) }
+          : { id: makeResponsesId("fc"), type: "function_call", status: "in_progress", call_id: st.callId || `call_${Date.now()}`, name: st.name || "function", arguments: "", ...(stNs ? { namespace: stNs } : null) };
         st.outputIndex = this.resp.output.length;
         events.push(sseResponses({ type: "response.output_item.added", output_index: st.outputIndex, item: { ...st.item } }));
       }
@@ -2172,6 +2297,8 @@ class ResponsesStreamConverter {
 
     for (const st of Object.values(this.toolStates)) {
       if (!st.item) continue;
+      // 名->namespace 补回 (创建时名字可能还没解析全, 这里按最终名再算一次)
+      const doneNs = (this.toolNamespaces && st.name && this.toolNamespaces.get(st.name)) || undefined;
       const doneItem = st.isCustom
         ? {
             ...st.item,
@@ -2179,6 +2306,7 @@ class ResponsesStreamConverter {
             call_id: st.callId || st.item.call_id,
             name: st.name || st.item.name,
             input: customInputFromArguments(st.argsBuf),
+            ...(doneNs ? { namespace: doneNs } : null),
           }
         : {
             ...st.item,
@@ -2186,6 +2314,7 @@ class ResponsesStreamConverter {
             call_id: st.callId || st.item.call_id,
             name: st.name || st.item.name,
             arguments: st.argsBuf,
+            ...(doneNs ? { namespace: doneNs } : null),
           };
       if (!st.isCustom) {
         push({ type: "response.function_call_arguments.done", item_id: st.item.id, output_index: st.outputIndex, arguments: st.argsBuf });
@@ -2243,6 +2372,20 @@ function buildUpstreamHeaders(req, extra) {
  */
 function upstreamError(message, opts = {}) {
   return Object.assign(new Error(message), opts);
+}
+
+/** 可中断的延迟 (客户端断开时提前结束, 不拖轮换收尾) */
+function sleepAbortable(ms, signal) {
+  return new Promise((resolve) => {
+    if (!(ms > 0)) return resolve();
+    let done = false;
+    const finish = () => { if (!done) { done = true; clearTimeout(t); resolve(); } };
+    const t = setTimeout(finish, ms);
+    if (signal) {
+      if (signal.aborted) finish();
+      else signal.addEventListener("abort", finish, { once: true });
+    }
+  });
 }
 
 /**
@@ -2309,7 +2452,9 @@ async function rawUpstreamFetch(url, init, signal) {
     ? setTimeout(() => ac.abort(upstreamError(`上游 ${Math.round(FIRST_BYTE_TIMEOUT / 1000)}s 未返回响应头`, { firstByteTimeout: true })), FIRST_BYTE_TIMEOUT)
     : null;
   try {
-    return await fetch(url, { ...init, signal: ac.signal });
+    const finalInit = { ...init, signal: ac.signal };
+    if (upstreamDispatcher && /^https?:\/\//.test(url)) finalInit.dispatcher = upstreamDispatcher;
+    return await fetch(url, finalInit);
   } finally {
     if (guard) clearTimeout(guard);
   }
@@ -2326,7 +2471,8 @@ async function upstreamFetch(url, init, requestedModel, signal, isFallback = tru
       throw upstreamError("客户端已断开, 终止上游请求", { clientAbort: true });
     }
     // 用户显式指定模型失败不冷却 (不去猜测能力); 回退/默认模型照常冷却
-    if (isFallback) onRequestFail(requestedModel);
+    // 网络层抛错 (连不上/断连) 不代表模型有问题, 一律不冷却 —— 否则一次网络抖动
+    // 会把无辜模型全部打入冷却, 造成"全部冷却中"的死局
     throw e;
   }
   if (!r.ok) {
@@ -2406,6 +2552,20 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
   const add = (m) => { if (m && !seen.has(m)) { seen.add(m); candidates.push(m); } };
   add(firstModel);
   for (const m of list) add(m);
+  // rotateModels=false: 只保留首个候选, 永不换模型 (重试逻辑不变)
+  const rotateRaw = config.rotateModels;
+  const rotateOnModels = rotateRaw === undefined ? true
+    : rotateRaw === true ? true
+    : (rotateRaw && typeof rotateRaw === "object")
+      ? !!(isImage ? (rotateRaw.image ?? rotateRaw.text) : (rotateRaw.text ?? rotateRaw.image))
+      : false;
+  if (!rotateOnModels && candidates.length > 1) {
+    if (!rotateShrinkWarned.has(isImage ? "img" : "txt")) {
+      rotateShrinkWarned.add(isImage ? "img" : "txt");
+      console.warn(TAGW, `rotateModels=false, 候选收缩为首选模型 (不轮换, 仅此提示一次)`);
+    }
+    candidates.length = 1;
+  }
   const pfx = sessTag ? `${sessTag()} ` : "";
   // 每个候选的尝试次数: 首个候选 firstModelAttempts (默认 2 = 首发 + 1 次重试), 后续轮换候选恒 1
   const firstAttempts = firstModelAttemptsFor(isImage);
@@ -2487,15 +2647,16 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       } catch (e) {
         if (e.clientAbort) throw e; // 客户端已断开, 立即终止, 不再重试
         lastErr = e;
-        // 用户显式指定模型失败不冷却, 只轮换; 回退/默认候选照常冷却
-        if (!isUserModel) markModelFail(model);
+        // 网络层失败不冷却任何模型 (连不上是链路问题, 不是模型能力问题);
+        // 用户显式指定模型的 HTTP 失败本就不冷却, 这里同样跳过
         // 网络层失败无 HTTP 状态: 按调用方收尾码记 502, 并把 code/msg 摘要写在这条配对行上
         const summary = upstreamErrSummary(e);
         const failHook = () => onAttemptFail && onAttemptFail({ status: 502, model, detail: summary, ms: Date.now() - t0, attempt: attemptNo, total: totalAttempts });
-        // 网络层失败 (含首字节超时) 属瞬时故障: 同模型原地重试
+        // 网络层失败 (含首字节超时) 属瞬时故障: 同模型原地重试, 先退避一小会扛住抖动
         if (a + 1 < tries) {
           failHook();
-          console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${summary}, 原地重试 ${tryTag()}`);
+          console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${summary}, ${(a + 1) * 0.6}s 后原地重试 ${tryTag()}`);
+          await sleepAbortable(Math.min(2000, 600 * (a + 1)), signal);
           continue;
         }
         if (i + 1 < candidates.length) {
@@ -2512,6 +2673,7 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
 }
 
 const blockedModelWarned = new Set();
+const rotateShrinkWarned = new Set();
 function warnBlockedModel(model) {
   if (blockedModelWarned.has(model)) return;
   blockedModelWarned.add(model);
@@ -3091,13 +3253,25 @@ setInterval(() => {
 // 中转侧曾出现主请求 300s 无响应头悬挂; 同会话改为排队发送规避并发
 // (config.serializeSessionRequests, 默认开)。排队中的请求若客户端断开,
 // 会经由 abort 信号立即失败出队, 不会占用队列。release 幂等, 可多处调用。
+// 有界等待 (config.sessionQueueMaxWaitMs, 默认 10000ms): 排队超过该时长仍未轮到,
+// 则降级为并发直行 (warn 日志标记), 避免长流把同会话兄弟请求卡死; 毫秒级到达的
+// 竞态仍被串行化, 原 workaround 继续生效。设为 0/负数恢复无限等待旧行为。
+const SESSION_QUEUE_MAX_WAIT_MS = parseInt(config.sessionQueueMaxWaitMs ?? "10000", 10);
 function acquireSessionLock(session) {
   if (!session || !SERIALIZE_SESSION) return Promise.resolve(() => {});
   const prev = session.lock || Promise.resolve();
   let release;
   const gate = new Promise((r) => (release = r));
   session.lock = prev.then(() => gate);
-  return prev.then(() => release);
+  if (!(SESSION_QUEUE_MAX_WAIT_MS > 0)) return prev.then(() => release);
+  let timer = null;
+  const timeoutP = new Promise((r) => { timer = setTimeout(() => r("timeout"), SESSION_QUEUE_MAX_WAIT_MS); });
+  return Promise.race([prev.then(() => "lock"), timeoutP]).then((v) => {
+    if (timer) clearTimeout(timer);
+    if (v === "lock") return release;
+    console.warn(TAGW, `会话排队 ${(SESSION_QUEUE_MAX_WAIT_MS / 1000).toFixed(0)}s 未轮到, 降级并发直行 (锁链保持)`);
+    return () => { try { release(); } catch { /*  repeating release harmless */ } };
+  });
 }
 
 function logTs(ms) {
@@ -3163,15 +3337,17 @@ const server = http.createServer(async (req, res) => {
   const ccSessionId = req.headers["x-claude-code-session-id"];
   const cxCodexSession = req.headers["session-id"] || req.headers["session_id"]; // 兼容旧版下划线头名
   const cxThreadId = req.headers["thread-id"];
+  // 锁粒度取最细可用标识: codex 父子线程共享 session-id 但 thread-id 不同,
+  // 按 thread 分锁后父子可并行 (同 thread 内仍串行)。cc 保持原样。
   const sessionKey = ccSessionId
     ? `cc:${ccSessionId}`
-    : cxCodexSession
-      ? `cx:${cxCodexSession}`
-      : cxThreadId
-        ? `cx:thread:${cxThreadId}`
+    : cxThreadId
+      ? `cx:thread:${cxThreadId}`
+      : cxCodexSession
+        ? `cx:${cxCodexSession}`
         : `${srcIp}:${req.socket.remotePort || "-"}|${req.headers["user-agent"] || "-"}`;
   // 稳定会话标识类型 (JSONL 记录用): 判定来源与 sessionKey 同源 (cc/cx/cx-thread/src)
-  const sessionIdType = ccSessionId ? "cc" : cxCodexSession ? "cx" : cxThreadId ? "cx-thread" : "src";
+  const sessionIdType = ccSessionId ? "cc" : cxThreadId ? "cx-thread" : cxCodexSession ? "cx" : "src";
   // 注意: 放在闭包变量而非 req._cmdc —— 路由分支会重建 req._cmdc, 直接赋值会丢失 session
   const session = MODEL_PATHS.includes(pathname) ? getSession(sessionKey) : null;
   // 请求编号: 会话内自增计数器, REQ 行与 RES 行成对输出 (S1#10), 便于两行配对;
@@ -3683,7 +3859,7 @@ const server = http.createServer(async (req, res) => {
       if (session) session.pending = (session.pending || 0) + 1;
       logReq();
 
-      const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey, { session });
+      const { chat: chatReq, customToolNames, toolNamespaces } = responsesToChatRequest(body, sessionKey, { session });
       // 带图请求: 按请求类型 (text/image) 选择轮换列表; 首个候选仍是解析后的模型
       const isImage = openAIMessagesHaveImages(chatReq.messages);
       // 带图前置路由 (visionAutoRoute): 转换后确认带图, 且模型判定不支持视觉时改走 defaultVisionModels[0]
@@ -3741,7 +3917,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const oai = JSON.parse(text);
           req._cmdc.usage = normalizeUsage(oai.usage);
-          const respObj = chatResponseToResponses(oai, requested, customToolNames);
+          const respObj = chatResponseToResponses(oai, requested, customToolNames, toolNamespaces);
           recordResponseReasoning(session, oai); // 记入会话缓存, 供后续轮次出站回填
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(respObj));
@@ -3759,7 +3935,7 @@ const server = http.createServer(async (req, res) => {
         res.end(text);
         return;
       }
-      const conv = new ResponsesStreamConverter(requested, estimateInputTokens(body), customToolNames);
+      const conv = new ResponsesStreamConverter(requested, estimateInputTokens(body), customToolNames, toolNamespaces);
       await pumpConvertedStream(up, conv, res, "responses", releaseUp, req._cmdc);
       recordStreamReasoning(session, conv); // 记入会话缓存, 供后续轮次出站回填
       req._cmdc.usage = normalizeUsage(conv.rawUsage);

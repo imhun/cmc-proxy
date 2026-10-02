@@ -1,6 +1,7 @@
 config.json
 goat-prices.json
 proxy.log
+output.log
 .workbuddy/
 
 # build 产物
@@ -10,3 +11,7 @@ fulllog*.log
 
 # 结构化 JSONL 请求日志 (jsonlLog)
 *.jsonl
+node_modules
+
+# macOS
+.DS_Store
